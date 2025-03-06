@@ -1,0 +1,9 @@
+nohup.out
+bak*
+back*
+*bak
+*back
+/png/*
+/html/*
+/.streamlit/
+/__pycache__/
