@@ -3,6 +3,9 @@ import pandas as pd
 from utils import write_message
 from graph import initialize_workflow
 
+
+SERVER_URL = st.secrets['SERVER_URL']
+
 # Page Config
 st.set_page_config("Company background searching", page_icon=":material/search:", layout="wide")
 
@@ -96,8 +99,8 @@ if st.session_state.processing and st.session_state.pending_companies:
             "company_name": company_name,
             "industry": final_industry,
             "ref_url": final_ref_url,
-            'screenshot_link': f"http://192.168.135.42:9875/{final_screenshot}",
-            'html_link': f"http://192.168.135.42:9875/{final_html}",
+            'screenshot_link': f"{SERVER_URL}{final_screenshot}",
+            'html_link': f"{SERVER_URL}{final_html}",
         })
         if final_industry:
             st.session_state.analysis_process.append(f'Industry: {final_industry}')
