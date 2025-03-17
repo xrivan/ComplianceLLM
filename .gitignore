@@ -7,3 +7,4 @@ back*
 /html/*
 /.streamlit/
 /__pycache__/
+crawler.log

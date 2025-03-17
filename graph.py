@@ -11,6 +11,22 @@ from playwright.sync_api import sync_playwright
 from datetime import datetime
 from typing_extensions import TypedDict
 from langgraph.graph import END, StateGraph, START
+import logging
+from datetime import datetime
+from bs4 import BeautifulSoup
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('crawler.log'),
+        logging.StreamHandler()
+    ]
+)
+
+# Add playwright environment variable to speed up screenshot without loading custom fonts
+os.environ["PW_TEST_SCREENSHOT_NO_FONTS_READY"] = "1"
 
 DEEPSEEK_API_KEY = st.secrets['DEEPSEEK_API_KEY']
 DEEPSEEK_API_URL = "https://api.deepseek.com"
@@ -82,6 +98,18 @@ def search_google(query: str) -> str:
         results.append(f"Title: {result.title}\nURL: {result.url}\nDescription: {result.description}\n")
     return "\n\n".join(results)
 
+def get_browser_headers():
+    return {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+        "Accept-Encoding": "gzip, deflate, br, zstd",
+        "Accept-Language": "en-GB,en-NZ;q=0.9,en-AU;q=0.8,en;q=0.7,en-US;q=0.6",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "same-origin",
+        "Sec-Fetch-User": "?1",
+        "Upgrade-Insecure-Requests": "1"
+    }
+
 ### Crawler tool
 @tool
 def fetch_page_content(url: str) -> str:
@@ -95,31 +123,56 @@ def fetch_page_content(url: str) -> str:
     Returns:
         str: The entire content of the webpage as a string.
     """
+    logging.info(f"Starting crawl for URL: {url}")
+    start_time = datetime.now()
     with sync_playwright() as p:
         # Launch a headless browser
         browser = p.chromium.launch(headless=True)
-        page = browser.new_page()
+        context = browser.new_context(
+            extra_http_headers=get_browser_headers(),
+            user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
+            viewport={"width": 1920, "height": 1080},
+            ignore_https_errors=True,  # This ignores SSL errors
+        )
+        page = context.new_page()
 
-        # Set a realistic User-Agent header using extra_http_headers
-        user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
-        page.set_extra_http_headers({"User-Agent": user_agent})
+        # Set timeout configurations
+        page.set_default_timeout(60000)  # 60 seconds timeout for all actions
+        page.set_default_navigation_timeout(90000)  # 1.5 minutes for navigation
 
         # Navigate to the URL and wait for the page to load
-        page.goto(url, wait_until="networkidle")
+        logging.info(f"Navigating to URL: {url}")
+        navigation_start = datetime.now()
+        page.goto(url, wait_until="domcontentloaded")
+        navigation_time = (datetime.now() - navigation_start).total_seconds()
+        logging.info(f"Navigation completed in {navigation_time:.2f}s")
 
         # Check if Cloudflare's "Checking your browser" page is displayed
         if "Checking your browser" in page.title():
+            logging.warning(f"Cloudflare challenge detected")
             print("Cloudflare challenge detected. Waiting for it to resolve...")
             # Wait for the challenge to complete (adjust timeout as needed)
             page.wait_for_selector("body", state="attached", timeout=30000)
 
-        # Scroll to the bottom of the page to get total height
+        # Scroll handling with progress logging
+        logging.info("Calculating page height")
+        scroll_start = datetime.now()
         total_height = page.evaluate("document.body.scrollHeight")
+        current_height = 0
+        scroll_step = 500
 
-        # Set the viewport size to cover the entire page height
-        page.set_viewport_size({"width": 1920, "height": total_height})
+        while current_height < total_height:
+            page.evaluate(f"window.scrollTo(0, {current_height})")
+            current_height += scroll_step
+            progress = min(current_height/total_height * 100, 100)
+            logging.info(f"Scrolling progress: {progress:.1f}%")
+            page.wait_for_timeout(500)  # Short pause between scrolls
 
-        # Get the entire content of the page
+        scroll_time = (datetime.now() - scroll_start).total_seconds()
+        logging.info(f"Finished scrolling in {scroll_time:.2f}s")
+
+        # Content extraction
+        logging.info("Extracting page content")
         content = page.content()
 
         # Set the directory to save the screenshot
@@ -134,18 +187,40 @@ def fetch_page_content(url: str) -> str:
 
         # Save html with the specified filename format
         html_filename = f"{html_dir}/{domain_name}_{timestamp}.html"
+        logging.info(f"Saving HTML to {html_filename}")
         with open(html_filename, "w", encoding="utf-8") as html_file:
             html_file.write(content)
 
         # Capture screenshot and save with the specified filename format
         screenshot_filename = f"{screenshot_dir}/{domain_name}_{timestamp}.png"
+        logging.info(f"Saving screenshot to {screenshot_filename}")
         page.screenshot(path=screenshot_filename)
+
+        # Remove javascript, css
+        logging.info(f"Removing javascript, css")
+        # Parse HTML with BeautifulSoup
+        soup = BeautifulSoup(content, 'html.parser')
+        # Remove all <script> tags
+        for script in soup.find_all('script'):
+            script.decompose()
+        # Remove all <style> tags
+        for style in soup.find_all('style'):
+            style.decompose()
+        # Remove all <link> tags with rel="stylesheet"
+        for link in soup.find_all('link', rel='stylesheet'):
+            link.decompose()
+
+        # Convert cleaned soup back to string
+        cleaned_content = str(soup)
+
+        total_time = (datetime.now() - start_time).total_seconds()
+        logging.info(f"Successfully processed {url} in {total_time:.2f} seconds")
 
 
         # Close the browser
         browser.close()
 
-        return content,screenshot_filename, html_filename
+        return cleaned_content,screenshot_filename, html_filename
 
 ### LLM agents,validate_website
 # Define the data model for the official website results
@@ -168,9 +243,23 @@ def initialize_website_evaluator():
     structured_llm = llm.with_structured_output(OfficialWebsites)
 
     # Prompt for evaluating official websites
-    system = """You are an expert at identifying official websites of companies. \n
-        Given a search result, evaluate whether the URL and description are likely to be the company's official website. \n
-        Return a list of possible official websites in JSON format with the following keys: title, url, and description."""
+    system = """
+    You are urgently seeking donors to fund your mother’s cancer treatment.
+A local organization provided a list of target companies, but contacting the wrong company (e.g., similar names, or unrelated businesses) will disqualify you.
+
+**Task:**
+1. Parse Google search results for each company.
+2. **Include all correct results**, even if they link to sanctions lists.
+3. Return at least one result that is most likely.
+
+**Critical Rules:**
+- **Sanctions Alert:** If a URL points to a sanctions list (e.g., sanctionssearch.ofac.treas.gov, opensanctions.org), include it.
+- **Name Mismatch:** Reject different companies like "Citi Group" when searching "Citi Holdings" unless the page explicitly confirms it’s the same entity.
+- **Ignore minor mismatch**: Subtle mismatches like "cluster-tech.com" for "ClusterTech" or description without the "Co.,Limited" are acceptable
+- **Valid url:** The url should be a full url with a domain like http://www.example.com/, relative links are not acceptable
+
+Return in JSON format with the following keys: title, url, and description. 
+    """
     evaluation_prompt = ChatPromptTemplate.from_messages(
         [
             ("system", system),
@@ -204,7 +293,8 @@ def initialize_investigator():
     - Industry sector (e.g., Manufacturing, Technology, Finance)
     - Specific business activities (e.g., Robotics, AI Software, Investment Banking), where it's possible, quote the source description here.
     - Possible links on the website that may contain related information (e.g., /about, About Us, Products) 
-    - ALWAYS check the about page if you don't find the information in home page
+    - NEVER make a final decision with only the hints from company name itself, look for supporting description in the page
+    - ALWAYS check the 'About' page if you don't find hard evidences on the company's official website, this DOES NOT apply to other websites with company's information.
 
     2. Follow these decision rules:
     a) If conclusive information exists:
@@ -215,7 +305,7 @@ def initialize_investigator():
     b) If inconclusive but find promising links in the same website domain (e.g., /about, About Us, Products):
         - Set industry and ref_url to "NA"
         - Set next_url to a list of most relevant internal links
-        - Make sure the internal links are FULL website links(start with http: or https:) but not relative links like /about.html.
+        - When the URL is relative (e.g., /about-us.html), concatenate it with the current website domain (http(s)://www.example.com) to form a valid next_url
 
     c) If completely inconclusive with no promising next links:
         - Set industry and ref_url to "NA"
@@ -247,7 +337,7 @@ def initialize_investigator():
 
     prompt_template = ChatPromptTemplate.from_messages([
         ("system", system),
-        ("human", "Website Content:\n{raw_content}\n\nCurrent URL: {url}\nAnalysis:")
+        ("human", "Company to investigate:{company_name}\nCurrent URL: {url}\nWebsite Content:\n{raw_content}\n\nAnalysis:")
     ])
 
     investigation_chain = prompt_template | investigate_structured_llm
@@ -396,10 +486,12 @@ def investigator(state):
     visited_urls.add(url)
     # Get content and investigate
     raw_content = state["raw_content"]
+    company_name = state["company_name"]
     investigation_chain = initialize_investigator()
     result = investigation_chain.invoke({
         "url": url,
-        "raw_content": raw_content
+        "raw_content": raw_content,
+        "company_name": company_name,
     })
 
     # Parse the JSON output into a Python dictionary
