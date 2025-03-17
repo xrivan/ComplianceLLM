@@ -99,8 +99,8 @@ if st.session_state.processing and st.session_state.pending_companies:
             "company_name": company_name,
             "industry": final_industry,
             "ref_url": final_ref_url,
-            'screenshot_link': f"{SERVER_URL}{final_screenshot}",
-            'html_link': f"{SERVER_URL}{final_html}",
+            'screenshot_link': "NA" if not final_screenshot else f"{SERVER_URL}{final_screenshot}",
+            'html_link': "NA" if not final_html else f"{SERVER_URL}{final_html}",
         })
         if final_industry:
             st.session_state.analysis_process.append(f'Industry: {final_industry}')

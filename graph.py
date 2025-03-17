@@ -14,6 +14,8 @@ from langgraph.graph import END, StateGraph, START
 import logging
 from datetime import datetime
 from bs4 import BeautifulSoup
+import requests
+from PyPDF2 import PdfReader
 
 # Configure logging
 logging.basicConfig(
@@ -98,6 +100,7 @@ def search_google(query: str) -> str:
         results.append(f"Title: {result.title}\nURL: {result.url}\nDescription: {result.description}\n")
     return "\n\n".join(results)
 
+### Crawler tool
 def get_browser_headers():
     return {
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
@@ -110,51 +113,108 @@ def get_browser_headers():
         "Upgrade-Insecure-Requests": "1"
     }
 
-### Crawler tool
-@tool
-def fetch_page_content(url: str) -> str:
+def fetch_pdf_content(url: str, html_dir: str) -> tuple[str, str]:
     """
-    Fetch the entire content of a webpage given its URL using Playwright's Sync API.
-    This function includes measures to handle Cloudflare's anti-bot protection.
+    Fetch and extract text content from a PDF file given its URL, and save the PDF in the html_dir.
 
     Args:
-        url (str): The URL of the webpage to fetch.
+        url (str): The URL of the PDF file to fetch.
+        html_dir (str): Directory to save the PDF file.
 
     Returns:
-        str: The entire content of the webpage as a string.
+        tuple: (content, pdf_filename)
+               - content: The extracted text from the PDF.
+               - pdf_filename: Path to the saved PDF file.
+    """
+    logging.info(f"Fetching PDF content from URL: {url}")
+    try:
+        # Download the PDF
+        response = requests.get(url, headers=get_browser_headers(), timeout=30)
+        response.raise_for_status()
+
+        # File name handling
+        domain_name = url.replace("http://", "").replace("https://", "").replace("/", "_")
+        timestamp = datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
+        pdf_filename = f"{html_dir}/{domain_name}_{timestamp}.pdf"
+
+        # Save the PDF
+        os.makedirs(html_dir, exist_ok=True)
+        with open(pdf_filename, "wb") as f:
+            f.write(response.content)
+        logging.info(f"Saved PDF to {pdf_filename}")
+
+        # Extract text using PyPDF2
+        pdf_reader = PdfReader(pdf_filename)
+        text_content = ""
+        for page in pdf_reader.pages:
+            text = page.extract_text()
+            if text:
+                text_content += text
+
+        logging.info(f"Successfully extracted text from PDF at {url}")
+        return text_content, pdf_filename
+
+    except Exception as e:
+        logging.error(f"Failed to process PDF at {url}: {str(e)}")
+        return f"Error fetching PDF content: {str(e)}", ""
+
+@tool
+def fetch_page_content(url: str) -> tuple[str, str, str]:
+    """
+    Fetch the entire content of a webpage or PDF given its URL.
+    For HTML, uses Playwright's Sync API. For PDFs, uses requests and PyPDF2.
+
+    Args:
+        url (str): The URL of the resource to fetch.
+
+    Returns:
+        tuple: (content, screenshot_filename, html_or_pdf_filename)
+               - content: The extracted content (HTML or PDF text)
+               - screenshot_filename: Path to screenshot (or empty string for PDFs)
+               - html_or_pdf_filename: Path to saved HTML or PDF file
     """
     logging.info(f"Starting crawl for URL: {url}")
     start_time = datetime.now()
+
+    html_dir = "./html"
+    screenshot_dir = "./png"
+
+    # Check if the URL is valid
+    if not url.lower().startswith("http"):
+        return "Empty page", "", ""  # Invalid URL
+
+    # Check if the URL points to a PDF
+    if url.lower().endswith(".pdf"):
+        content, pdf_filename = fetch_pdf_content(url, html_dir)
+        total_time = (datetime.now() - start_time).total_seconds()
+        logging.info(f"Processed PDF {url} in {total_time:.2f} seconds")
+        return content, "", pdf_filename  # No screenshot for PDFs
+
+    # Handle HTML pages with Playwright
     with sync_playwright() as p:
-        # Launch a headless browser
         browser = p.chromium.launch(headless=True)
         context = browser.new_context(
             extra_http_headers=get_browser_headers(),
             user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
             viewport={"width": 1920, "height": 1080},
-            ignore_https_errors=True,  # This ignores SSL errors
+            ignore_https_errors=True,
         )
         page = context.new_page()
 
-        # Set timeout configurations
-        page.set_default_timeout(60000)  # 60 seconds timeout for all actions
-        page.set_default_navigation_timeout(90000)  # 1.5 minutes for navigation
+        page.set_default_timeout(60000)
+        page.set_default_navigation_timeout(90000)
 
-        # Navigate to the URL and wait for the page to load
         logging.info(f"Navigating to URL: {url}")
         navigation_start = datetime.now()
         page.goto(url, wait_until="domcontentloaded")
         navigation_time = (datetime.now() - navigation_start).total_seconds()
         logging.info(f"Navigation completed in {navigation_time:.2f}s")
 
-        # Check if Cloudflare's "Checking your browser" page is displayed
         if "Checking your browser" in page.title():
-            logging.warning(f"Cloudflare challenge detected")
+            logging.warning("Cloudflare challenge detected")
             print("Cloudflare challenge detected. Waiting for it to resolve...")
-            # Wait for the challenge to complete (adjust timeout as needed)
             page.wait_for_selector("body", state="attached", timeout=30000)
 
-        # Scroll handling with progress logging
         logging.info("Calculating page height")
         scroll_start = datetime.now()
         total_height = page.evaluate("document.body.scrollHeight")
@@ -164,63 +224,48 @@ def fetch_page_content(url: str) -> str:
         while current_height < total_height:
             page.evaluate(f"window.scrollTo(0, {current_height})")
             current_height += scroll_step
-            progress = min(current_height/total_height * 100, 100)
+            progress = min(current_height / total_height * 100, 100)
             logging.info(f"Scrolling progress: {progress:.1f}%")
-            page.wait_for_timeout(500)  # Short pause between scrolls
+            page.wait_for_timeout(500)
 
         scroll_time = (datetime.now() - scroll_start).total_seconds()
         logging.info(f"Finished scrolling in {scroll_time:.2f}s")
 
-        # Content extraction
         logging.info("Extracting page content")
         content = page.content()
 
-        # Set the directory to save the screenshot
-        screenshot_dir = "./png"
-        html_dir = "./html"
-        os.makedirs(screenshot_dir, exist_ok=True)  # Create the directory if it doesn't exist
+        os.makedirs(screenshot_dir, exist_ok=True)
         os.makedirs(html_dir, exist_ok=True)
 
-        # File name handling
-        domain_name = url.replace("http://", "").replace("https://", "").replace("/","_")
+        domain_name = url.replace("http://", "").replace("https://", "").replace("/", "_")
         timestamp = datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
 
-        # Save html with the specified filename format
         html_filename = f"{html_dir}/{domain_name}_{timestamp}.html"
         logging.info(f"Saving HTML to {html_filename}")
         with open(html_filename, "w", encoding="utf-8") as html_file:
             html_file.write(content)
 
-        # Capture screenshot and save with the specified filename format
         screenshot_filename = f"{screenshot_dir}/{domain_name}_{timestamp}.png"
         logging.info(f"Saving screenshot to {screenshot_filename}")
         page.screenshot(path=screenshot_filename)
 
-        # Remove javascript, css
-        logging.info(f"Removing javascript, css")
-        # Parse HTML with BeautifulSoup
+        logging.info("Removing javascript, css")
         soup = BeautifulSoup(content, 'html.parser')
-        # Remove all <script> tags
         for script in soup.find_all('script'):
             script.decompose()
-        # Remove all <style> tags
         for style in soup.find_all('style'):
             style.decompose()
-        # Remove all <link> tags with rel="stylesheet"
         for link in soup.find_all('link', rel='stylesheet'):
             link.decompose()
 
-        # Convert cleaned soup back to string
         cleaned_content = str(soup)
 
         total_time = (datetime.now() - start_time).total_seconds()
         logging.info(f"Successfully processed {url} in {total_time:.2f} seconds")
 
-
-        # Close the browser
         browser.close()
 
-        return cleaned_content,screenshot_filename, html_filename
+        return cleaned_content, screenshot_filename, html_filename
 
 ### LLM agents,validate_website
 # Define the data model for the official website results
@@ -256,7 +301,7 @@ A local organization provided a list of target companies, but contacting the wro
 - **Sanctions Alert:** If a URL points to a sanctions list (e.g., sanctionssearch.ofac.treas.gov, opensanctions.org), include it.
 - **Name Mismatch:** Reject different companies like "Citi Group" when searching "Citi Holdings" unless the page explicitly confirms it’s the same entity.
 - **Ignore minor mismatch**: Subtle mismatches like "cluster-tech.com" for "ClusterTech" or description without the "Co.,Limited" are acceptable
-- **Valid url:** The url should be a full url with a domain like http://www.example.com/, relative links are not acceptable
+- **Valid url:** The url should be a full url with a domain like http://www.example.com/, relative links are not acceptable, urls ended with .pdf are acceptable
 
 Return in JSON format with the following keys: title, url, and description. 
     """
@@ -289,7 +334,7 @@ def initialize_investigator():
     system = """You are a commercial investigation expert analyzing company websites. 
     Let's think step by step.
     Your tasks:
-    1. Look in html <body> block and analyze the content to determine:
+    1. Look in html <body> block if it's html content or all content if it's pure text and analyze the content to determine:
     - Industry sector (e.g., Manufacturing, Technology, Finance)
     - Specific business activities (e.g., Robotics, AI Software, Investment Banking), where it's possible, quote the source description here.
     - Possible links on the website that may contain related information (e.g., /about, About Us, Products) 
